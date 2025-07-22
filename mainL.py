@@ -7,8 +7,8 @@ from tqdm import tqdm
 import csv 
 
 CONFIG = {
-    "MODEL_NAME": "facebook/nllb-200-distilled-600M",
-    "BATCH_SIZE": 20,
+    "MODEL_NAME": "facebook/nllb-200-3.3B",  # Changed to 3B model
+    "BATCH_SIZE": 8,  # Reduced batch size for larger model
     "INPUT_FILE": "dataset.csv",
     "OUTPUT_FILE": "translated_dataset.csv",
     "PROGRESS_FILE": "translation_progress.json",
@@ -18,7 +18,14 @@ CONFIG = {
     "SOURCE_LANG": "eng_Latn",
     "TARGET_LANG": "ben_Beng",
     "START_INDEX": 0,
-    "END_INDEX": None
+    "END_INDEX": None,
+    # New configuration options for better quality
+    "USE_FP16": True,  # Enable 16-bit precision
+    "NUM_BEAMS": 4,  # Use beam search for better quality
+    "LENGTH_PENALTY": 0.6,  # Encourage slightly shorter translations
+    "NO_REPEAT_NGRAM_SIZE": 2,  # Prevent repetition
+    "EARLY_STOPPING": True,  # Stop when all beams have ended
+    "DO_SAMPLE": False,  # Use deterministic decoding with beam search
 }
 
 class CSVTranslator:
@@ -47,15 +54,36 @@ class CSVTranslator:
         print(f"Progress saved: {last_index - data_start_index + 1}/{total_rows} rows processed")
     
     def load_model(self):
-        """Load the translation model and tokenizer"""
+        """Load the translation model and tokenizer with optimizations"""
         print(f"Loading model: {self.config['MODEL_NAME']}")
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.config["MODEL_NAME"])
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(self.config["MODEL_NAME"])
+            
+            # Load model with optimizations
+            model_kwargs = {}
+            if self.config["DEVICE"] == "cuda" and torch.cuda.is_available():
+                if self.config["USE_FP16"]:
+                    model_kwargs["torch_dtype"] = torch.float16
+                    print("Loading model with 16-bit precision")
+                
+                # Optional: Use device_map for multi-GPU setups
+                # model_kwargs["device_map"] = "auto"
+            
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                self.config["MODEL_NAME"],
+                **model_kwargs
+            )
             
             if self.config["DEVICE"] == "cuda" and torch.cuda.is_available():
-                self.model = self.model.to("cuda")
+                if "device_map" not in model_kwargs:  # Only move if not using device_map
+                    self.model = self.model.to("cuda")
                 print("Model loaded on GPU")
+                
+                # Print GPU memory usage
+                if torch.cuda.is_available():
+                    memory_allocated = torch.cuda.memory_allocated() / 1024**3
+                    memory_reserved = torch.cuda.memory_reserved() / 1024**3
+                    print(f"GPU Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB")
             else:
                 print("Model loaded on CPU")
                 
@@ -64,7 +92,7 @@ class CSVTranslator:
             raise
     
     def translate_text(self, text):
-        """Translate a single text string"""
+        """Translate a single text string with enhanced quality settings"""
         if pd.isna(text) or text == "":
             return ""
         
@@ -87,10 +115,20 @@ class CSVTranslator:
             target_lang_id = self.tokenizer.convert_tokens_to_ids(self.config["TARGET_LANG"])
                        
             with torch.no_grad():
+                # Enhanced generation parameters for better quality
+                generation_kwargs = {
+                    "forced_bos_token_id": target_lang_id,
+                    "max_length": self.config["MAX_LENGTH"],
+                    "num_beams": self.config["NUM_BEAMS"],
+                    "length_penalty": self.config["LENGTH_PENALTY"],
+                    "no_repeat_ngram_size": self.config["NO_REPEAT_NGRAM_SIZE"],
+                    "early_stopping": self.config["EARLY_STOPPING"],
+                    "do_sample": self.config["DO_SAMPLE"],
+                }
+                
                 translated_tokens = self.model.generate(
-                    **inputs, 
-                    forced_bos_token_id=target_lang_id,
-                    max_length=self.config["MAX_LENGTH"]
+                    **inputs,
+                    **generation_kwargs
                 )
 
             result = self.tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
@@ -101,7 +139,7 @@ class CSVTranslator:
             return text
     
     def translate_batch2(self, df_batch):
-        """Translate a batch of rows using batch inference"""
+        """Translate a batch of rows using enhanced batch inference"""
         translated_batch = df_batch.copy()
         
         for col in self.config["COLUMNS_TO_TRANSLATE"]:
@@ -123,11 +161,23 @@ class CSVTranslator:
                     inputs = {k: v.to("cuda") for k, v in inputs.items()}
                 
                 target_lang_id = self.tokenizer.convert_tokens_to_ids(self.config["TARGET_LANG"])
-                translated_tokens = self.model.generate(
-                    **inputs, 
-                    forced_bos_token_id=target_lang_id,
-                    max_length=self.config["MAX_LENGTH"]
-                )
+                
+                # Enhanced generation parameters for better quality
+                generation_kwargs = {
+                    "forced_bos_token_id": target_lang_id,
+                    "max_length": self.config["MAX_LENGTH"],
+                    "num_beams": self.config["NUM_BEAMS"],
+                    "length_penalty": self.config["LENGTH_PENALTY"],
+                    "no_repeat_ngram_size": self.config["NO_REPEAT_NGRAM_SIZE"],
+                    "early_stopping": self.config["EARLY_STOPPING"],
+                    "do_sample": self.config["DO_SAMPLE"],
+                }
+                
+                with torch.no_grad():
+                    translated_tokens = self.model.generate(
+                        **inputs,
+                        **generation_kwargs
+                    )
                 
                 results = self.tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
                 translated_batch[f"{col}_bn"] = results
@@ -177,6 +227,11 @@ class CSVTranslator:
     
     def run_translation(self):
         """Main translation process"""
+        # Check GPU memory availability
+        if self.config["DEVICE"] == "cuda" and torch.cuda.is_available():
+            total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            print(f"Total GPU Memory: {total_memory:.2f}GB")
+        
         # Load the dataset range
         df, data_start_index, data_end_index = self.load_dataset_range()
         
@@ -200,6 +255,7 @@ class CSVTranslator:
         
         print(f"Starting translation from relative row {start_relative_index} (absolute row {data_start_index + start_relative_index})")
         print(f"Columns to translate: {self.config['COLUMNS_TO_TRANSLATE']}")
+        print(f"Translation settings: 16-bit={self.config['USE_FP16']}, Beams={self.config['NUM_BEAMS']}, Batch size={self.config['BATCH_SIZE']}")
         
         # Create or load output file
         output_exists = os.path.exists(self.config["OUTPUT_FILE"])
